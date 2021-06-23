@@ -1,0 +1,437 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>{{}}</title>
+    <style>
+        * {
+            padding: 0;
+            margin: 0
+        }
+    </style>
+    <script src="pixi.min.js"></script>
+</head>
+
+<body>
+    <script type="text/javascript">
+
+        let staged_cache = [];
+
+        // we control our own update loop
+        // var ticker = PIXI.Ticker.shared;
+        // ticker.autoStart = false;
+        // ticker.stop();
+
+        // make full screen pixi "canvas"
+        let app = new PIXI.Application({ antialias: true });
+
+        app.renderer.view.style.position = "absolute";
+        app.renderer.view.style.display = "block";
+        app.renderer.autoDensity = true;
+        app.renderer.resize(window.innerWidth, window.innerHeight);
+        app.stage.sortableChildren = true;
+
+        let global_x = 0;
+        let global_y = 0;
+        let global_rot = 0;
+
+        function set_translation(x, y) {
+            global_x = x;
+            global_y = y;
+            app.stage.x = window.innerWidth / 2 + x;
+            app.stage.y = window.innerHeight / 2 + y;
+            redraw_grids();
+        }
+
+        set_translation(0, 0);
+        window.onresize = function (event) {
+            app.renderer.resize(window.innerWidth, window.innerHeight);
+            set_translation(global_x, global_y);
+        };
+        // app.renderer.backgroundColor = 0x061639;
+
+        // we control our own update loop
+        app.ticker.autoStart = false;
+        app.ticker.stop();
+        app.renderer.plugins.interaction.destroy();
+        app.renderer.plugins.interaction = null;
+
+        document.body.appendChild(app.view);
+
+        // set default pixels per meter scale
+        default_scale = 64;
+        app.stage.scale.x = default_scale;
+        app.stage.scale.y = -default_scale;
+        // app.stage.rotation = -Math.PI / 2;
+
+        user_scale = 1.0;
+        total_scale = default_scale * user_scale;
+        is_zoom_fixed = false;
+
+        function set_zoom(zoom) {
+            user_scale = zoom;
+            total_scale = default_scale * user_scale;
+            app.stage.scale.x = total_scale;
+            app.stage.scale.y = -total_scale;
+            redraw_lines();
+        }
+
+        window.onwheel = function (event) {
+            //console.log(event.deltaY);
+            if (!is_zoom_fixed) {
+                let scale_factor = (1 + Math.min(Math.max(event.deltaY, -20), 20) / 100);
+                let new_user_scale = user_scale * scale_factor;
+
+                let rel_x = event.x - window.innerWidth / 2 - global_x;
+                let rel_y = event.y - window.innerHeight / 2 - global_y;
+                global_x += rel_x * (1 - scale_factor);
+                global_y += rel_y * (1 - scale_factor);
+                set_translation(global_x, global_y);
+
+                set_zoom(new_user_scale);
+            }
+        }
+
+        is_mouse_down = false;
+        last_mouse_x = 0;
+        last_mouse_y = 0;
+
+        window.onmousedown = function (event) {
+            is_mouse_down = true;
+            last_mouse_x = event.x;
+            last_mouse_y = event.y;
+        }
+
+        window.onmouseup = function (event) {
+            is_mouse_down = false;
+        }
+
+        window.onmousemove = function (event) {
+            if (is_mouse_down) {
+                global_x += event.x - last_mouse_x;
+                global_y += event.y - last_mouse_y;
+                last_mouse_x = event.x;
+                last_mouse_y = event.y;
+                set_translation(global_x, global_y);
+            }
+        }
+
+        function redraw_grids() {
+            for (let i = 0; i < staged_cache.length; i++) {
+                let inner = staged_cache[i].inner;
+                if (typeof inner === 'object' && "Grid" in inner) {
+                    draw_shape(staged_cache[i]);
+                }
+            }
+            app.ticker.update(performance.now());
+        }
+
+        // redraw all shapes that have lines in them (aren't filled)
+        function redraw_lines() {
+            for (let i = 0; i < staged_cache.length; i++) {
+                let inner = staged_cache[i].inner;
+                if (typeof inner === 'object' && ("Grid" in inner || "Line" in inner || "Lines" in inner)) {
+                    draw_shape(staged_cache[i]);
+                }
+            }
+            app.ticker.update(performance.now());
+        }
+
+        // tx and ty are translations used by the Array shape
+        function inner_draw_shape(shape, tx, ty) {
+            let g = shape.g;
+
+            if (shape.inner === "Circle") {
+                // need more points in the circle!!!
+                // because it doesn't handle our global scale and use of meters very well :(
+                g.beginFill(shape.outer.color, shape.outer.alpha);
+                g.drawCircle(tx, ty, 10.0);
+                g.endFill();
+                // g.drawCircle(tx, ty, 1.0);
+            } else if (shape.inner === "Square") {
+                g.beginFill(shape.outer.color, shape.outer.alpha);
+                g.drawRect(tx - 0.5, ty - 0.5, 1.0, 1.0);
+                g.endFill();
+            } else if ("Line" in shape.inner) {
+                g.lineStyle(shape.inner.Line.line_width / total_scale, shape.outer.color, shape.outer.alpha);
+                g.moveTo(shape.inner.Line.points[0] + tx, shape.inner.Line.points[1] + ty);
+                g.lineTo(shape.inner.Line.points[2] + tx, shape.inner.Line.points[3] + ty);
+            } else if ("Lines" in shape.inner) {
+                g.lineStyle(shape.inner.Lines.line_width / total_scale, shape.outer.color, shape.outer.alpha);
+
+                let points = shape.inner.Lines.points;
+                g.moveTo(points[0] + tx, points[1] + ty);
+                for (let i = 1; i < points.length / 2; i += 1) {
+                    g.lineTo(points[i * 2] + tx, points[i * 2 + 1] + ty);
+                }
+            } else if ("Grid" in shape.inner) {
+                g.x = -Math.trunc(global_x / total_scale); // should be always centered on zero, regardless of global translation
+                g.y = Math.trunc(global_y / total_scale);
+                g.lineStyle(shape.inner.Grid.line_width / total_scale, shape.outer.color, shape.outer.alpha);
+
+                let width_meters_half = Math.ceil(window.innerWidth / Math.abs(app.stage.scale.x) / 2) + 1;
+                let height_meters_half = Math.ceil(window.innerHeight / Math.abs(app.stage.scale.y) / 2) + 1;
+                for (let x = -width_meters_half; x <= width_meters_half; x++) {
+                    g.moveTo(x, -height_meters_half);
+                    g.lineTo(x, height_meters_half);
+                }
+                for (let y = -height_meters_half; y <= height_meters_half; y++) {
+                    g.moveTo(-width_meters_half, y);
+                    g.lineTo(width_meters_half, y);
+                }
+            } else if ("Polygon" in shape.inner) {
+                let points = shape.inner.Polygon.points.slice();
+                for (let i = 0; i < points.length; i += 2) {
+                    points[i] += tx;
+                    points[i + 1] += ty;
+                }
+                g.beginFill(shape.outer.color, shape.outer.alpha);
+                g.drawPolygon(points);
+                g.endFill();
+                // g.drawPolygon(shape.inner.Polygon.points);
+            } else if ("Bitmap8" in shape.inner) {
+                let image = shape.inner.Bitmap8.image;
+                let width = shape.inner.Bitmap8.width;
+                let height = image.length / width;
+                let has_palette = "palette" in shape.inner.Bitmap8;
+
+                let idx = 0;
+                for (let y = 0; y < height; y++) {
+                    for (let x = 0; x < width; x++) {
+                        if (has_palette) {
+                            let palette = shape.inner.Bitmap8.palette;
+                            let color_i = image[idx];
+                            if (color_i >= palette.length) {
+                                console.log("WARNING: color_i " + color_i + " clamped to maximum value " + (palette.length - 1));
+                                color_i = palette.length - 1;
+                            }
+                            let rgba = palette[color_i];
+                            g.beginFill(rgba.rgb, rgba.a);
+                        } else {
+                            g.beginFill(0x010101 * image[idx], shape.outer.alpha);
+                        }
+                        g.drawRect(x, y, 1.0, 1.0);
+                        idx += 1;
+                    }
+                }
+            } else if ("Text" in shape.inner) {
+                g.style = new PIXI.TextStyle({
+                    fontFamily: shape.inner.Text.font_family,
+                    fontSize: shape.inner.Text.font_size,
+                    fill: shape.outer.color,
+                });
+                g.text = shape.inner.Text.text;
+            } else if ("Array" in shape.inner) {
+                // make a texture from the shape, and then repeat it with sprites
+                // necessary for okay performance here.
+                // var sprite_g = new PIXI.Graphics();
+                // let array_shape = shape.inner.Array.shape;
+                // sprite_g.beginFill(array_shape.outer.color, array_shape.outer.alpha);
+                // array_shape.g = sprite_g;
+                // inner_draw_shape(array_shape);
+                // sprite_g.endFill();
+                // let texture = app.renderer.generateTexture(sprite_g);
+                //
+                // let points = shape.inner.Array.points;
+                // g.removeChildren();
+                // for (let i = 0; i < points.length; i += 2) {
+                //     let sprite = new PIXI.Sprite(texture);
+                //     sprite.position.x = points[i];// / array_shape.outer.scale[0];
+                //     sprite.position.y = points[i + 1];// / array_shape.outer.scale[1];
+                //     apply_shape_outer(sprite, array_shape);
+                //     g.addChild(sprite);
+                // }
+                // sprite_g.destroy();
+
+                let array_shape = shape.inner.Array.shape;
+                apply_shape_outer(g, array_shape);
+                array_shape.g = g;
+
+                let scale_x = array_shape.outer.scale[0];
+                let scale_y = array_shape.outer.scale[1];
+
+                if (array_shape.inner === "Circle") {
+                    array_shape.g.scale.x *= 0.1;
+                    array_shape.g.scale.y *= 0.1;
+                    scale_x *= 0.1;
+                    scale_y *= 0.1;
+                }
+
+                let points = shape.inner.Array.points;
+                for (let i = 0; i < points.length; i += 2) {
+                    let tx = points[i] / scale_x;
+                    let ty = points[i + 1] / scale_y;
+                    inner_draw_shape(array_shape, tx, ty);
+                }
+            }
+        }
+
+        function draw_shape(shape) {
+            let g = shape.g;
+            let is_graphics = g instanceof PIXI.Graphics;
+            if (is_graphics) {
+                g.clear();
+            }
+
+            inner_draw_shape(shape, 0, 0);
+        }
+
+        function clear_transforms(g) {
+            g.x = 0;
+            g.y = 0;
+            g.rotation = 0;
+            g.scale.x = 1;
+            g.scale.y = 1;
+            g.alpha = 1;
+        }
+
+        function apply_shape_outer(g, shape) {
+            g.x += shape.outer.x;
+            g.y += shape.outer.y;
+            g.rotation += shape.outer.rot;
+            g.scale.x *= shape.outer.scale[0];
+            g.scale.y *= shape.outer.scale[1];
+            g.alpha *= shape.outer.alpha;
+
+            // need more points in the circle!!!
+            // because it doesn't handle our global scale and use of meters very well :(
+            let cached = staged_cache[shape.outer.idx];
+            if (cached.inner === "Circle") {
+                g.scale.x *= 0.1;
+                g.scale.y *= 0.1;
+            } else if (typeof cached.inner === 'object') {
+                if ("Text" in cached.inner) {
+                    // g.rotation += Math.PI/2;
+                    g.scale.x *= 0.02;
+                    g.scale.y *= -0.02;
+                }
+            }
+        }
+
+        function perform_update(shapes) {
+            for (let i = 0; i < shapes.length; i++) {
+                let shape = shapes[i].shape;
+
+                let idx = shape.outer.idx;
+
+                // the staged object can be either PIXI.Graphics or PIXI.Text
+                // and it is important to use the right one!!
+                let need_to_replace_old = false;
+                if (idx in staged_cache) {
+                    let is_text = typeof shape.inner === "object" && "Text" in shape.inner;
+                    let old_is_text = staged_cache[idx].g instanceof PIXI.Text;
+                    if (is_text !== old_is_text && shape.inner !== "TransformedOnly") {
+                        need_to_replace_old = true;
+                    }
+                }
+                // once we get a single delete, we just get rid of everything after
+                // since both ends of the system just use a flat array and modify before deleting
+                if (shape.inner === "Deleted") {
+                    while (staged_cache.length > idx) {
+                        staged_cache[idx].g.destroy();
+                        app.stage.removeChild(staged_cache[idx].g);
+                        staged_cache.splice(idx, 1);
+                    }
+                    continue;
+                }
+                if (need_to_replace_old) {
+                    staged_cache[idx].g.destroy();
+                    app.stage.removeChild(staged_cache[idx].g);
+                    delete staged_cache[idx];
+                }
+
+                if (!(idx in staged_cache)) {
+                    let new_g;
+                    let is_text = typeof shape.inner === "object" && "Text" in shape.inner;
+                    if (is_text) {
+                        new_g = new PIXI.Text("");
+                    } else {
+                        new_g = new PIXI.Graphics();
+                    }
+                    new_g.zIndex = idx;
+                    staged_cache[idx] = shape;
+                    staged_cache[idx].g = new_g;
+                    app.stage.addChild(new_g);
+                }
+                staged_cache[idx].hash = shapes[i].hash;
+                staged_cache[idx].outer = shape.outer;
+                if (shape.inner !== "TransformedOnly") {
+                    staged_cache[idx].inner = shape.inner;
+                }
+
+                let g = staged_cache[idx].g;
+                clear_transforms(g);
+                apply_shape_outer(g, shape);
+
+                if (shape.inner !== "TransformedOnly") {
+                    draw_shape(staged_cache[idx]);
+                }
+            }
+
+            app.ticker.update(performance.now());
+        }
+
+        let consecutive_empty_frames = 0;
+        function requestReadyStateChange() {
+            if (this.readyState == 4) {
+                if (this.status == 200) {
+                    let data = JSON.parse(this.responseText);
+                    document.title = data.title;
+                    if (data.user_zoom !== null) {
+                        is_zoom_fixed = true;
+                        set_zoom(data.user_zoom);
+                    } else {
+                        is_zoom_fixed = false;
+                    }
+
+                    global_rot = data.global_rot;
+                    app.stage.rotation = global_rot;
+
+                    let shapes = data.shapes;
+                    if (shapes.length == 0) {
+                        consecutive_empty_frames += 1;
+                    } else {
+                        consecutive_empty_frames = 0;
+                        perform_update(shapes);
+                    }
+                    if (consecutive_empty_frames < 160) {
+                        requestAnimationFrame(request_update);
+                        return;
+                    }
+                }
+                // don't go crazy when we have nothing to do
+                setTimeout(function () {
+                    requestAnimationFrame(request_update);
+                }, 500);
+            }
+        }
+
+        function request_update() {
+            let req = new XMLHttpRequest();
+            req.onreadystatechange = requestReadyStateChange;
+            req.open('POST', '/graphics_update', true);
+            req.setRequestHeader("Content-Type", "application/json;charset=UTF-8");
+
+            hashes = []
+            for (let i = 0; i < staged_cache.length; i++) {
+                hashes.push(staged_cache[i].hash);
+            }
+
+            req.send(JSON.stringify(hashes));
+        }
+        request_update();
+
+// let line = new PIXI.Graphics();
+// line.lineStyle(4, 0xFFFFFF, 1);
+// line.moveTo(0, 0);
+// line.lineTo(80, 50);
+// line.lineTo(120, 50);
+// line.x = 32;
+// line.y = 32;
+// app.stage.addChild(line);
+
+    </script>
+</body>
+
+</html>
