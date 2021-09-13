@@ -696,6 +696,10 @@ impl Rvx {
         self.last = new_active.clone();
         *self.active.lock().unwrap() = new_active;
     }
+
+    pub fn shapes(&self) -> &[Shape] {
+        &self.working
+    }
 }
 
 impl Drop for Rvx {
