@@ -1,21 +1,12 @@
-#[macro_use]
-extern crate rocket;
-extern crate serde;
-
-use rocket::http::ContentType;
-use rocket::response::content;
-use rocket::serde::{json::Json, Serialize};
-use rocket::State;
-use std::collections::HashSet;
-use std::net::IpAddr;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::thread;
-// use std::collections::HashMap;
+use hyper::header::CONTENT_TYPE;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 #[derive(Serialize, Copy, Clone, Hash, Debug, PartialEq, Eq)]
 pub struct RvxColor {
@@ -312,108 +303,83 @@ struct Packet {
     global_rot: f64,
 }
 
-#[post("/graphics_update", format = "json", data = "<hashes>")]
-fn handle_graphics_update(data: &State<Rvx>, hashes: Json<Vec<(u32, u32)>>) -> Json<Packet> {
-    let mut active = data.active.lock().unwrap();
-    let changes = examine_changed(&mut active, &*hashes);
-    Json(Packet {
-        title: data.title.clone(),
-        shapes: changes,
-        user_zoom: *data.user_zoom.lock().unwrap(),
-        global_rot: *data.global_rot.lock().unwrap(),
-    })
-}
-
 const INDEX_HTML: &'static str = include_str!("../index.html");
 const PIXI_JS: &'static str = include_str!("../pixi.min.js");
 const PIXI_JS_MAP: &'static str = include_str!("../pixi.min.js.map");
 
-#[get("/")]
-fn handle_index_html(data: &State<Rvx>) -> content::Html<String> {
-    let mut index_html = INDEX_HTML.to_owned();
-    let offset = index_html.find("{{}}");
-    if let Some(offset) = offset {
-        index_html.replace_range(offset..offset + 4, &data.title);
+async fn respond(mut req: Request<Body>, rvx: Arc<Rvx>) -> Result<Response<Body>, hyper::Error> {
+    match (req.method(), req.uri().path()) {
+        // Serve some instructions at /
+        (&Method::GET, "/") => {
+            let mut index_html = INDEX_HTML.to_owned();
+            let offset = index_html.find("{{}}");
+            if let Some(offset) = offset {
+                index_html.replace_range(offset..offset + 4, &rvx.title);
+            }
+            Ok(Response::builder()
+                .header(CONTENT_TYPE, "text/html")
+                .body(Body::from(index_html))
+                .unwrap())
+        }
+        (&Method::GET, "/pixi.min.js") => Ok(Response::builder()
+            .header(CONTENT_TYPE, "application/javascript")
+            .body(Body::from(PIXI_JS))
+            .unwrap()),
+        (&Method::GET, "/pixi.min.js.map") => Ok(Response::builder()
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(Body::from(PIXI_JS_MAP))
+            .unwrap()),
+        (&Method::POST, "/graphics_update") => {
+            let body_bytes = hyper::body::to_bytes(req.body_mut()).await?;
+            let body_content = String::from_utf8(body_bytes.to_vec()).unwrap();
+            let hashes: Vec<(u32, u32)> = serde_json::from_str(&body_content).unwrap();
+            let mut active = rvx.active.lock().unwrap();
+            let changes = examine_changed(&mut active, &hashes);
+            let packet = Packet {
+                title: rvx.title.clone(),
+                shapes: changes,
+                user_zoom: *rvx.user_zoom.lock().unwrap(),
+                global_rot: *rvx.global_rot.lock().unwrap(),
+            };
+
+            Ok(Response::builder()
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_string(&packet).unwrap()))
+                .unwrap())
+        }
+
+        // Return the 404 Not Found for other routes.
+        _ => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::default())
+            .unwrap()),
     }
-
-    content::Html(index_html)
 }
 
-#[get("/pixi.min.js")]
-fn handle_pixi_js() -> content::JavaScript<&'static str> {
-    content::JavaScript(PIXI_JS)
-}
-
-#[get("/pixi.min.js.map")]
-fn handle_pixi_js_map() -> content::Custom<&'static str> {
-    content::Custom(ContentType::Binary, PIXI_JS_MAP)
-}
-
-// #[actix_rt::main]
-// async fn run_server(r: Rvx, addr_port: String, stop_rx: mpsc::Receiver<()>) -> std::io::Result<()> {
-//     let server = HttpServer::new(move || {
-//         App::new()
-//             .wrap(middleware::Compress::default())
-//             .data(r.clone())
-//             .app_data(web::JsonConfig::default().limit(128 * 1024))
-//             .route("/", web::get().to(handle_index_html))
-//             .route("/pixi.min.js", web::get().to(handle_pixi_js))
-//             .route("/pixi.min.js.map", web::get().to(handle_pixi_js_map))
-//             .route("/graphics_update", web::post().to(handle_graphics_update))
-//     })
-//     .disable_signals()
-//     .bind(addr_port)?
-//     .run();
-//
-//     let thread_server = server.clone();
-//     thread::spawn(move || {
-//         stop_rx.recv().unwrap();
-//         executor::block_on(thread_server.stop(false));
-//     });
-//
-//     server.await
-// }
-
-fn run_server(r: Rvx, addr: [u8; 4], port: u16, running: Arc<AtomicBool>) {
+fn run_server(r: Rvx, addr: [u8; 4], port: u16, done_rx: tokio::sync::oneshot::Receiver<()>) {
     thread::spawn(move || {
-        let mut config = rocket::Config::debug_default();
-        config.log_level = rocket::log::LogLevel::Critical;
-        config.address = IpAddr::from(addr);
-        config.port = port;
-        config.shutdown = rocket::config::Shutdown {
-            ctrlc: false,
-            signals: HashSet::new(),
-            ..Default::default()
-        };
-
-        let rocket_future = rocket::custom(config.clone())
-            .manage(r)
-            .mount(
-                "/",
-                routes![
-                    handle_index_html,
-                    handle_pixi_js,
-                    handle_pixi_js_map,
-                    handle_graphics_update,
-                ],
-            )
-            .launch();
+        let rvx = Arc::new(r);
+        let make_svc = make_service_fn(|_conn| {
+            let rvx = rvx.clone();
+            async { Ok::<_, hyper::Error>(service_fn(move |req| respond(req, rvx.clone()))) }
+        });
 
         // borrowed from unstable rocket::async_main
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(config.workers)
-            // NOTE: graceful shutdown depends on the "rocket-worker" prefix.
-            .thread_name("rocket-worker-thread")
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("create tokio runtime")
-            .block_on(rocket_future)
+            .block_on(async {
+                let server = Server::bind(&SocketAddr::from((addr, port))).serve(make_svc);
+
+                // And now add a graceful shutdown signal...
+                let graceful = server.with_graceful_shutdown(async {
+                    let _ = done_rx.await;
+                });
+                graceful.await
+            })
             .unwrap();
     });
-
-    while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_micros(100));
-    }
 }
 
 #[derive(Clone)]
@@ -430,12 +396,12 @@ pub struct Rvx {
     active: Arc<Mutex<Vec<HashedShape>>>,
     user_zoom: Arc<Mutex<Option<f64>>>,
     thread: Option<Arc<thread::JoinHandle<()>>>,
-    running: Arc<AtomicBool>,
+    done_tx: Option<Arc<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl Rvx {
     pub fn new(title: &str, addr: [u8; 4], port: u16) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
         let mut r = Rvx {
             title: title.to_owned(),
@@ -450,13 +416,14 @@ impl Rvx {
             active: Arc::new(Mutex::new(Vec::new())),
             user_zoom: Arc::new(Mutex::new(None)),
             thread: None,
-            running: running.clone(),
+            done_tx: None,
         };
         let thread_r = r.clone();
         let thread_addr = addr.to_owned();
         r.thread = Some(Arc::new(thread::spawn(move || {
-            run_server(thread_r, thread_addr, port, running);
+            run_server(thread_r, thread_addr, port, done_rx);
         })));
+        r.done_tx = Some(Arc::new(done_tx));
         r
     }
 
@@ -706,7 +673,10 @@ impl Drop for Rvx {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
             if let Some(thread) = Arc::try_unwrap(thread).ok() {
-                self.running.store(false, Ordering::SeqCst);
+                Arc::try_unwrap(self.done_tx.take().unwrap())
+                    .unwrap()
+                    .send(())
+                    .unwrap();
                 thread.join().unwrap();
             }
         }
@@ -735,6 +705,6 @@ mod tests {
 
         r.commit_changes();
         std::thread::sleep(std::time::Duration::from_secs(4));
-        panic!();
+        panic!(); // to make sure all output gets shown (or we could remember to use cargo test -- --nocapture)
     }
 }
